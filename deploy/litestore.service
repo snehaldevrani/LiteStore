@@ -1,0 +1,20 @@
+[Unit]
+Description=LiteStore Redis-like Server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/litestore
+EnvironmentFile=/etc/litestore/litestore.env
+ExecStart=/opt/litestore/.venv/bin/python src/main.py --host ${LITESTORE_HOST} --port ${LITESTORE_PORT} --metrics-host ${LITESTORE_METRICS_HOST} --metrics-port ${LITESTORE_METRICS_PORT} --workers ${LITESTORE_WORKERS} --aof-path ${LITESTORE_AOF_PATH}
+Restart=always
+RestartSec=3
+User=litestore
+Group=litestore
+NoNewPrivileges=true
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

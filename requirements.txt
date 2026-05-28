@@ -1,0 +1,2 @@
+# LiteStore dependencies
+# Add runtime and test dependencies during implementation.
