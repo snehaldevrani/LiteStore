@@ -281,6 +281,3 @@ Deployment artifacts: `deploy/litestore.service`, `deploy/litestore.env.example`
 
 Built a multi-process Redis alternative with shared-nothing key-space sharding (Dragonfly-inspired), O(1) timing-wheel TTL eviction, Count-Min Sketch hot-key detection, configurable-fsync AOF persistence, and built-in Prometheus observability — deployed and benchmarked on AWS EC2.
 
-## Source of Truth
-
-Project blueprint and scope are defined in `redis.md`.
