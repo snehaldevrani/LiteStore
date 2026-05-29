@@ -23,6 +23,9 @@ def test_worker_ownership_isolated_between_partitions() -> None:
         "w2": StoreWorker("w2", 2),
     }
 
+    for worker in workers.values():
+        worker.start()
+
     key_a = _find_key_for_worker(router, "w0")
     key_b = _find_key_for_worker(router, "w1")
 
@@ -42,6 +45,9 @@ def test_sharded_dispatch_preserves_command_behavior() -> None:
         "w1": StoreWorker("w1", 1),
         "w2": StoreWorker("w2", 2),
     }
+
+    for worker in workers.values():
+        worker.start()
 
     set_request = CommandRequest(command=CommandName.SET, args=("order:1", "created"))
     set_response = _dispatch(router, workers, set_request)

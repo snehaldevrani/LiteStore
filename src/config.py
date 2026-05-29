@@ -16,3 +16,5 @@ class LiteStoreConfig:
 	metrics_port: int = 9100
 	worker_count: int = 4
 	aof_path: Path = Path("data/litestore.aof")
+	metrics_refresh_interval_seconds: float = 5.0
+	use_multiprocessing: bool = True

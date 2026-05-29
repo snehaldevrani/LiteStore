@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Iterable
 
 from .interfaces import PersistenceInterface
-from .types import CommandName, CommandRequest, PersistRecord
+from .types import CommandName, CommandRequest, FsyncPolicy, PersistRecord
 
 
 class AofPersistence(PersistenceInterface):
@@ -16,11 +17,20 @@ class AofPersistence(PersistenceInterface):
 	Each line is a JSON object with sequence, command, and args fields.
 	"""
 
-	def __init__(self, file_path: str | Path) -> None:
+	def __init__(
+		self,
+		file_path: str | Path,
+		*,
+		fsync_policy: FsyncPolicy = FsyncPolicy.EVERY_N,
+		fsync_every_n: int = 100,
+	) -> None:
 		self._file_path = Path(file_path)
 		self._file_path.parent.mkdir(parents=True, exist_ok=True)
 		self._file = self._file_path.open("a+", encoding="utf-8")
 		self._next_sequence = self._discover_next_sequence()
+		self._fsync_policy = fsync_policy
+		self._fsync_every_n = fsync_every_n
+		self._writes_since_fsync = 0
 
 	def append(self, record: PersistRecord) -> None:
 		"""Append one mutation record to the AOF in write order."""
@@ -31,6 +41,15 @@ class AofPersistence(PersistenceInterface):
 		}
 		self._file.write(json.dumps(payload, ensure_ascii=True) + "\n")
 		self._file.flush()
+		self._writes_since_fsync += 1
+
+		if self._fsync_policy == FsyncPolicy.ALWAYS:
+			os.fsync(self._file.fileno())
+			self._writes_since_fsync = 0
+		elif self._fsync_policy == FsyncPolicy.EVERY_N:
+			if self._writes_since_fsync >= self._fsync_every_n:
+				os.fsync(self._file.fileno())
+				self._writes_since_fsync = 0
 
 	def append_request(self, request: CommandRequest) -> PersistRecord:
 		"""Build and append a new record using local monotonic sequence."""
@@ -53,8 +72,17 @@ class AofPersistence(PersistenceInterface):
 
 				yield parsed
 
+	def force_fsync(self) -> None:
+		"""Force an immediate fsync regardless of policy."""
+		self._file.flush()
+		os.fsync(self._file.fileno())
+		self._writes_since_fsync = 0
+
 	def close(self) -> None:
-		"""Close file resources."""
+		"""Close file resources with a final fsync."""
+		if self._writes_since_fsync > 0 and self._fsync_policy != FsyncPolicy.NEVER:
+			self._file.flush()
+			os.fsync(self._file.fileno())
 		self._file.close()
 
 	def _discover_next_sequence(self) -> int:

@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 
-def test_benchmark_compare_includes_threaded_mode() -> None:
+def test_benchmark_compare_includes_multiprocessing_mode() -> None:
     root = Path(__file__).resolve().parents[1]
     script = root / "scripts" / "benchmark_compare.py"
 
@@ -25,8 +25,10 @@ def test_benchmark_compare_includes_threaded_mode() -> None:
         check=True,
         capture_output=True,
         text=True,
+        timeout=30,
     )
 
     output = result.stdout
-    assert "threaded-sharded-2-workers" in output
+    assert "multiprocess-2-workers" in output
     assert "single-store" in output
+    assert "sharded-2-workers" in output

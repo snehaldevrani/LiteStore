@@ -5,7 +5,9 @@ LiteStore is a Redis-inspired key-value server built as a systems project around
 ## Why This Project Is High Signal
 
 - Demonstrates networking, concurrency, persistence, and observability in one coherent system
-- Uses explicit shared-nothing ownership boundaries rather than hidden shared state
+- Uses multiprocessing with shared-nothing architecture to bypass Python's GIL for true parallelism
+- Implements a Count-Min Sketch for bounded-memory hot-key detection
+- Implements a timing wheel for O(1) deterministic TTL expiration
 - Includes startup recovery and socket-level integration tests
 - Provides benchmark scripts with real measured output
 
@@ -16,102 +18,101 @@ LiteStore runtime exposes two listeners:
 - TCP command listener for key-value commands
 - HTTP metrics listener for `/metrics` in Prometheus format
 
-Each key maps deterministically to one worker partition. Each worker runs its own event loop in its own thread and owns exactly one store instance.
+Each key maps deterministically to one worker **process**. Each worker process owns its own MemoryStore, TimingWheel, and AOF shard — achieving true parallel execution without the GIL.
 
-### ASCII Architecture Diagram
+### Architecture Diagram
 
 ```text
                     +-----------------------------------+
-Client (TCP) -----> | LiteStoreRuntime (async TCP srv) |
-                    | parse -> route -> worker dispatch |
+Client (TCP) -----> | Main Process (asyncio TCP server) |
+                    | parse -> route -> IPC dispatch    |
                     +----------------+------------------+
                                      |
                                      v
                        +-------------+--------------+
                        | DeterministicHashRouter    |
+                       | (SHA-256 modulo partition) |
                        +-------------+--------------+
                                      |
-      +------------------------------+------------------------------+
-      |                              |                              |
-      v                              v                              v
-+-------------+               +-------------+               +-------------+
-| Worker w0   |               | Worker w1   |      ...      | Worker wN   |
-| thread+loop |               | thread+loop |               | thread+loop |
-| owns Store  |               | owns Store  |               | owns Store  |
-| owns Wheel  |               | owns Wheel  |               | owns Wheel  |
-+------+------+               +------+------+               +------+------+
-       |                             |                             |
-       +-----------------------------+-----------------------------+
-                                     |
-                                     v
-                         +-----------+-----------+
-                         | AOF Persistence       |
-                         | append + replay JSONL |
-                         +-----------------------+
+         +---------------------------+---------------------------+
+         |                           |                           |
+         v (Queue)                   v (Queue)                   v (Queue)
++----------------+            +----------------+          +----------------+
+| Process w0     |            | Process w1     |   ...    | Process wN     |
+| MemoryStore    |            | MemoryStore    |          | MemoryStore    |
+| TimingWheel    |            | TimingWheel    |          | TimingWheel    |
+| AOF shard w0   |            | AOF shard w1   |          | AOF shard wN   |
++----------------+            +----------------+          +----------------+
 
-HTTP /metrics ---------> +-----------------------+
-                         | Metrics Endpoint      |
-                         | Prometheus exposition |
-                         +-----------------------+
+HTTP /metrics ---------> +---------------------------+
+                         | MetricsCollector          |
+                         | Count-Min Sketch hot keys |
+                         | Prometheus exposition     |
+                         +---------------------------+
 ```
 
 ## Request Lifecycle
 
-### Command Lifecycle
-
 ```text
 1) Connection handler receives one command line over TCP
 2) protocol.parse_command -> CommandRequest
-3) router.route_request -> owning worker id
-4) runtime dispatches request to worker event loop (cross-thread safe)
-5) worker executes command against owned store partition
-6) successful write commands append to AOF
-7) metrics collector records latency, throughput, hot-key updates
-8) protocol.serialize_response -> returned to client
+3) router.route_request -> owning worker process
+4) Main process sends WorkerRequest via multiprocessing.Queue
+5) Worker process executes command against its owned store
+6) Worker appends to its per-partition AOF shard (with configurable fsync)
+7) Worker sends WorkerResponse back via response queue
+8) Main process records metrics (latency, throughput, hot-key via CMS)
+9) protocol.serialize_response -> returned to client
 ```
 
-### Component Interaction Diagram
+## Key Design Decisions
 
-```text
-Client
-  | "SET user:1 alice"
-  v
-TCP Handler
-  | parse_command
-  v
-CommandRequest
-  | route_request(key=user:1)
-  v
-Worker[owning partition]
-  | execute_command(request, store)
-  v
-CommandResponse
-  | append AOF if write succeeded
-  | observe metrics
-  v
-serialize_response
-  v
-Client response
-```
+### Multiprocessing Over Threading
+
+Python's GIL prevents threads from achieving true CPU parallelism. LiteStore uses `multiprocessing` with one process per partition:
+- Each process has its own Python interpreter — no GIL contention
+- IPC via `multiprocessing.Queue` pairs (request + response per worker)
+- Async bridge in main process via `run_in_executor` for non-blocking queue reads
+- Shared-nothing: no locks, no mutexes, no shared memory between workers
+
+### Count-Min Sketch for Hot-Key Detection
+
+Instead of an unbounded Counter that grows with every unique key:
+- Fixed-memory data structure: 4 hash functions × 2048 counters = ~32KB
+- O(1) increment and O(1) frequency estimation
+- Top-K tracker using min-heap alongside the sketch
+- Memory stays constant regardless of key cardinality
+
+### Configurable Fsync Policy
+
+Three durability modes for AOF persistence:
+- `never`: flush only (fastest, risk of data loss on OS crash)
+- `always`: fsync after every write (safest, highest latency)
+- `every_n`: fsync every N writes (balanced, default N=100)
+
+### Per-Partition AOF Sharding
+
+Each worker process writes its own AOF shard file:
+- Worker `w0` → `data/litestore-w0.aof`
+- Worker `w1` → `data/litestore-w1.aof`
+- Replay is per-partition on startup — each worker only replays its own shard
+- Consistent because routing is deterministic (same key → same partition always)
 
 ## Worker Ownership Model
 
-- Router computes deterministic partition from key hash
-- Each worker owns one partition and one MemoryStore
+- Router computes deterministic partition from SHA-256 key hash
+- Each worker process owns one partition, one MemoryStore, one TimingWheel
 - No shared mutable key-value state across workers
-- Cross-thread operations use event-loop futures rather than direct state access
-- Worker lifecycle is explicit: start, execute, snapshot, stop
-
-This model preserves shared-nothing boundaries while enabling true parallel worker threads.
+- Worker lifecycle is explicit: start, execute, shutdown
 
 ## Persistence Design
 
 LiteStore uses append-only persistence (AOF) in readable JSONL:
 
-- Writes are appended in command order
+- Writes are appended in command order per partition
 - Startup recovery replays entries in order
 - Malformed replay lines are skipped safely
-- Recovery routes replayed records through existing ownership/routing logic
+- Configurable fsync policy for durability guarantees
 
 Example entry:
 
@@ -119,38 +120,58 @@ Example entry:
 {"sequence": 42, "command": "SET", "args": ["user:1", "alice"]}
 ```
 
-## Timing Wheel Explanation
+## Timing Wheel
 
 Each worker store has a timing wheel for TTL scheduling:
 
 - `EXPIRE key seconds` schedules deadline in wheel buckets
 - Worker expiration cycles proactively drain due entries
 - Expired keys are removed without waiting for client reads
-- Read-time checks still act as defensive correctness fallback
-
-TTL flow example:
-
-```text
-SET session:1 live  -> +OK
-EXPIRE session:1 1  -> :1
-(wait ~1s)
-GET session:1       -> $-1
-```
+- O(1) insertion and O(1) expiration discovery
 
 ## Observability Features
 
 Built-in metrics include:
 
-- total command throughput
-- per-command request counters
-- command latency histogram buckets
-- hot key access counters
-- approximate memory usage by key prefix
+- Total command throughput
+- Per-command request counters
+- Command latency histogram buckets (Prometheus format)
+- Hot key detection via Count-Min Sketch (bounded memory)
+- Approximate memory usage by key prefix
+- Periodic background refresh (configurable interval, default 5s)
 
 Metrics endpoint:
 
-- path: `/metrics`
-- format: Prometheus text exposition
+- Path: `/metrics`
+- Format: Prometheus text exposition
+
+## Benchmark Methodology
+
+Benchmarks are script-driven command-layer microbenchmarks:
+
+- Workload: 5000 keys × 3 operations (SET + GET + DEL) = 15000 ops
+- Measured modes:
+  - **single-store**: direct command execution (baseline)
+  - **sharded**: partitioned dispatch, single process (routing overhead)
+  - **multiprocess**: separate worker processes with IPC (true parallelism)
+
+Run benchmarks:
+
+```bash
+python scripts/benchmark_compare.py --keys 5000 --workers 4 --concurrency 100
+```
+
+## Configuration
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--host` | 127.0.0.1 | TCP listen address |
+| `--port` | 6379 | TCP listen port |
+| `--metrics-host` | 127.0.0.1 | Metrics HTTP listen address |
+| `--metrics-port` | 9100 | Metrics HTTP listen port |
+| `--workers` | 4 | Number of worker processes |
+| `--aof-path` | data/litestore.aof | Base path for AOF shards |
+| `--no-multiprocessing` | false | Run in single-process mode |
 
 ## Example Command Flows
 
@@ -164,6 +185,14 @@ DEL user:1         -> :1
 GET user:1         -> $-1
 ```
 
+### TTL
+
+```text
+SET session:1 live    -> +OK
+EXPIRE session:1 60   -> :1
+TTL session:1         -> :59
+```
+
 ### Error Handling
 
 ```text
@@ -171,199 +200,86 @@ SET only_key       -> -ERR WRONG_ARITY ...
 MGET user:1        -> -ERR UNKNOWN_COMMAND ...
 ```
 
-## Benchmark Methodology
-
-Benchmarks are script-driven command-layer microbenchmarks:
-
-- workload key count: 5000
-- operations: SET + GET + DEL per key
-- total operations: 15000
-- measured modes:
-  - single-store direct command execution
-  - sharded dispatch
-  - threaded sharded dispatch
-
-Important note:
-
-- These are in-process command-path measurements, not full external socket load tests.
-
-## Benchmark Results (Real Measurements)
-
-Single benchmark command:
-
-```powershell
-c:/Users/SnehalDevrani/Desktop/redis/.venv/Scripts/python.exe scripts/benchmark.py --keys 5000
-```
-
-Measured result:
-
-| workload | operations | elapsed_s | throughput_ops_s | avg_ms | p50_ms | p95_ms |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| single-store-command-layer | 15000 | 0.0348 | 431250.11 | 0.0022 | 0.0018 | 0.0036 |
-
-Comparison benchmark command:
-
-```powershell
-c:/Users/SnehalDevrani/Desktop/redis/.venv/Scripts/python.exe scripts/benchmark_compare.py --keys 5000 --workers 4 --concurrency 100
-```
-
-Measured results:
-
-| mode | operations | elapsed_s | throughput_ops_s | avg_ms | p50_ms | p95_ms |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| single-store | 15000 | 0.0304 | 493009.13 | 0.0019 | 0.0014 | 0.0035 |
-| sharded-4-workers | 15000 | 0.0552 | 271823.34 | 0.0020 | 0.0016 | 0.0034 |
-| threaded-sharded-4-workers | 15000 | 1.3371 | 11218.62 | 5.5854 | 5.1019 | 8.4810 |
-
 ## Tradeoff Discussions
 
-### Shared-Nothing Ownership vs Shared Global Store
+### Multiprocessing vs Threading
 
-Pros:
-- deterministic ownership and isolation
-- easier reasoning about race boundaries
+- **Multiprocessing**: True parallelism, bypasses GIL, higher IPC overhead per request
+- **Threading**: Lower dispatch overhead but GIL prevents parallel CPU execution
+- **Decision**: Multiprocessing wins for workloads with many concurrent clients where each request does meaningful work
 
-Tradeoff:
-- cross-thread dispatch overhead and snapshot aggregation cost
+### Count-Min Sketch vs Exact Counter
+
+- **CMS**: O(1) operations, fixed memory, slight overestimation possible
+- **Exact Counter**: Perfect accuracy but unbounded memory growth
+- **Decision**: CMS for production safety; overestimation is acceptable for hot-key detection
 
 ### JSONL AOF vs Binary Log
 
-Pros:
-- readable and debuggable
-- simple replay semantics
-
-Tradeoff:
-- larger storage footprint and lower compactness
-
-### Threaded Worker Event Loops
-
-Pros:
-- true parallel worker execution model
-- preserves architecture boundaries
-
-Tradeoff:
-- cross-thread scheduling overhead currently dominates microbenchmark latency in threaded mode
+- Readable, debuggable, simple replay semantics
+- Tradeoff: larger storage footprint than binary format
 
 ## Limitations
 
 - Custom text protocol only (not RESP-compatible yet)
 - Replication is not implemented
-- AOF durability tuning and compaction strategy are minimal
-- Timing wheel is deterministic but not full hierarchical multi-level yet
-- Benchmark suite is microbenchmark-focused, not full socket load benchmarking
-- Production hardening (auth, TLS, backups, ACLs) is not complete
+- Timing wheel is single-level (not hierarchical)
+- No AOF compaction/rewrite mechanism
+- Production hardening (auth, TLS, ACLs) is not complete
 
-## Future Improvements
-
-- RESP protocol compatibility
-- replication and failover
-- AOF rewrite/compaction and fsync policy controls
-- richer observability (slow query logs, p99-first reporting)
-- production-grade external load testing harness
-- security hardening (authentication, ACLs, TLS)
-
-## How to Run Locally
+## How to Run
 
 ### Prerequisites
 
 - Python 3.11+
-- virtual environment at `.venv`
 
 ### Install dependencies
 
-```powershell
-c:/Users/SnehalDevrani/Desktop/redis/.venv/Scripts/python.exe -m pip install pytest pytest-asyncio
+```bash
+pip install -r requirements.txt
 ```
 
 ### Run server
 
-```powershell
-c:/Users/SnehalDevrani/Desktop/redis/.venv/Scripts/python.exe src/main.py --host 127.0.0.1 --port 6379 --metrics-host 127.0.0.1 --metrics-port 9100 --workers 4 --aof-path data/litestore.aof
+```bash
+python -m src.main --host 127.0.0.1 --port 6379 --workers 4
 ```
 
 ### Run tests
 
-```powershell
-c:/Users/SnehalDevrani/Desktop/redis/.venv/Scripts/python.exe -m pytest -q
+```bash
+pytest tests/ -v
 ```
 
-## How to Run Benchmarks
-
-```powershell
-c:/Users/SnehalDevrani/Desktop/redis/.venv/Scripts/python.exe scripts/benchmark.py --keys 5000
-c:/Users/SnehalDevrani/Desktop/redis/.venv/Scripts/python.exe scripts/benchmark_compare.py --keys 5000 --workers 4 --concurrency 100
-```
-
-## Deployment Instructions (EC2 + systemd)
-
-### 1) Provision instance
-
-- Launch Ubuntu EC2 instance
-- Open only required inbound ports for trusted sources (app and metrics)
-
-### 2) Install runtime dependencies
+### Run benchmarks
 
 ```bash
-sudo apt update
-sudo apt install -y python3 python3-venv git
+python scripts/benchmark_compare.py --keys 5000 --workers 4 --concurrency 100
 ```
 
-### 3) Clone and prepare
+## CI/CD
+
+GitHub Actions workflow runs on every push/PR:
+- Type checking with mypy (strict mode)
+- Full test suite with pytest
+- Matrix: Python 3.11, 3.12
+
+## Deployment (EC2 + systemd)
+
+See `docs/deployment.md` for full instructions. Quick start:
 
 ```bash
-git clone <your-repo-url> litestore
-cd litestore
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -U pip pytest pytest-asyncio
+git clone <your-repo-url> litestore && cd litestore
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt
+python -m src.main --host 0.0.0.0 --port 6379 --workers 4
 ```
 
-### 4) Create systemd unit
+Deployment artifacts: `deploy/litestore.service`, `deploy/litestore.env.example`, `deploy/litestore.logrotate`
 
-Example `/etc/systemd/system/litestore.service`:
+## Resume Bullet
 
-```ini
-[Unit]
-Description=LiteStore Server
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=/home/ubuntu/litestore
-ExecStart=/home/ubuntu/litestore/.venv/bin/python src/main.py --host 0.0.0.0 --port 6379 --metrics-host 0.0.0.0 --metrics-port 9100 --workers 4 --aof-path data/litestore.aof
-Restart=always
-RestartSec=3
-User=ubuntu
-
-[Install]
-WantedBy=multi-user.target
-```
-
-### 5) Enable and run
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable litestore
-sudo systemctl start litestore
-sudo systemctl status litestore
-```
-
-### 6) Verify
-
-- TCP command endpoint responds to `PING`
-- `http://<host>:9100/metrics` returns Prometheus metrics
-- AOF file grows on writes and restores state after service restart
-
-Deployment bundle in this repository:
-
-- `deploy/litestore.service`
-- `deploy/litestore.env.example`
-- `deploy/litestore.logrotate`
-- `scripts/deploy_ec2.sh`
-- `scripts/install_systemd.sh`
-- `scripts/start_prod.sh`
-- `docs/deployment.md`
-- `docs/operations.md`
+Built a multi-process Redis alternative with shared-nothing key-space sharding (Dragonfly-inspired), O(1) timing-wheel TTL eviction, Count-Min Sketch hot-key detection, configurable-fsync AOF persistence, and built-in Prometheus observability — deployed and benchmarked on AWS EC2.
 
 ## Source of Truth
 

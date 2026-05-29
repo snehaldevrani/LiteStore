@@ -1,2 +1,4 @@
-# LiteStore dependencies
-# Add runtime and test dependencies during implementation.
+# LiteStore dev dependencies
+pytest>=7.0
+pytest-asyncio>=0.21
+mypy>=1.5

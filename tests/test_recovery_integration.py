@@ -33,6 +33,7 @@ async def test_restart_replays_aof_and_restores_state(tmp_path: Path) -> None:
         metrics_port=0,
         worker_count=2,
         aof_path=aof_path,
+        use_multiprocessing=False,
     )
 
     first = LiteStoreRuntime(base_config)
@@ -64,6 +65,7 @@ async def test_end_to_end_ttl_flow_over_socket(tmp_path: Path) -> None:
         metrics_port=0,
         worker_count=2,
         aof_path=tmp_path / "ttl_flow.aof",
+        use_multiprocessing=False,
     )
     runtime = LiteStoreRuntime(config)
     await runtime.start()

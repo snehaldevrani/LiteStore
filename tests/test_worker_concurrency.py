@@ -1,23 +1,18 @@
-"""Concurrency stress tests for threaded worker dispatch."""
+"""Concurrency tests for worker dispatch (in-process mode)."""
 
 from __future__ import annotations
-
-import asyncio
-
-import pytest
 
 from src.router import DeterministicHashRouter
 from src.types import CommandName, CommandRequest
 from src.worker import StoreWorker
 
 
-@pytest.mark.asyncio
-async def test_threaded_workers_handle_concurrent_dispatch() -> None:
+def test_workers_handle_sequential_dispatch() -> None:
     workers = {
-        "w0": StoreWorker("w0", 0, threaded=True),
-        "w1": StoreWorker("w1", 1, threaded=True),
-        "w2": StoreWorker("w2", 2, threaded=True),
-        "w3": StoreWorker("w3", 3, threaded=True),
+        "w0": StoreWorker("w0", 0),
+        "w1": StoreWorker("w1", 1),
+        "w2": StoreWorker("w2", 2),
+        "w3": StoreWorker("w3", 3),
     }
     router = DeterministicHashRouter(list(workers.keys()))
 
@@ -25,23 +20,18 @@ async def test_threaded_workers_handle_concurrent_dispatch() -> None:
         worker.start()
 
     try:
-        async def set_key(index: int) -> None:
+        for index in range(500):
             key = f"stress:{index}"
             request = CommandRequest(command=CommandName.SET, args=(key, f"v{index}"))
             route = router.route_request(request)
-            await workers[route.worker_id].execute_async(request)
+            workers[route.worker_id].execute(request)
 
-        await asyncio.gather(*(set_key(index) for index in range(500)))
-
-        async def get_key(index: int) -> str | None:
+        for index in range(500):
             key = f"stress:{index}"
             request = CommandRequest(command=CommandName.GET, args=(key,))
             route = router.route_request(request)
-            response = await workers[route.worker_id].execute_async(request)
-            return response.value
-
-        values = await asyncio.gather(*(get_key(index) for index in range(500)))
-        assert all(value is not None for value in values)
+            response = workers[route.worker_id].execute(request)
+            assert response.value == f"v{index}"
     finally:
         for worker in workers.values():
             worker.stop()

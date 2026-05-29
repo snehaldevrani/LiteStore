@@ -1,0 +1,26 @@
+[project]
+name = "litestore"
+version = "0.1.0"
+description = "A multi-threaded Redis alternative with timing-wheel TTL, AOF persistence, and built-in observability"
+requires-python = ">=3.11"
+license = "MIT"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "mypy>=1.5",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["src"]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"

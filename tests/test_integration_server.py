@@ -50,6 +50,7 @@ async def test_tcp_command_flow_and_metrics_endpoint(tmp_path: Path) -> None:
         metrics_port=0,
         worker_count=2,
         aof_path=tmp_path / "runtime.aof",
+        use_multiprocessing=False,
     )
     runtime = LiteStoreRuntime(config)
     await runtime.start()
@@ -77,6 +78,7 @@ async def test_invalid_command_returns_protocol_error(tmp_path: Path) -> None:
         metrics_port=0,
         worker_count=2,
         aof_path=tmp_path / "invalid.aof",
+        use_multiprocessing=False,
     )
     runtime = LiteStoreRuntime(config)
     await runtime.start()

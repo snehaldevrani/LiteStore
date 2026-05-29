@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import multiprocessing
 from pathlib import Path
 
 try:
@@ -22,6 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metrics-port", type=int, default=9100)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--aof-path", default="data/litestore.aof")
+    parser.add_argument("--no-multiprocessing", action="store_true", help="Run in single-process mode")
     return parser.parse_args()
 
 
@@ -35,6 +37,7 @@ async def run_runtime(config: LiteStoreConfig) -> None:
 
 
 def main() -> None:
+    multiprocessing.set_start_method("spawn", force=True)
     args = parse_args()
     config = LiteStoreConfig(
         host=args.host,
@@ -43,6 +46,7 @@ def main() -> None:
         metrics_port=args.metrics_port,
         worker_count=args.workers,
         aof_path=Path(args.aof_path),
+        use_multiprocessing=not args.no_multiprocessing,
     )
     try:
         asyncio.run(run_runtime(config))

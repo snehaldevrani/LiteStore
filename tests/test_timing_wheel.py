@@ -45,6 +45,7 @@ def test_worker_cycle_prevents_lingering_stale_keys_beyond_deadline() -> None:
     clock = FakeClock()
     store = MemoryStore(time_source=clock.now, timing_wheel=TimingWheel(tick_seconds=0.1, bucket_count=32))
     worker = StoreWorker("w0", 0, store=store)
+    worker.start()
 
     worker.execute(CommandRequest(command=CommandName.SET, args=("job:1", "queued")))
     worker.execute(CommandRequest(command=CommandName.EXPIRE, args=("job:1", "3")))

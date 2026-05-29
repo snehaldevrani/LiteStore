@@ -7,13 +7,14 @@ from dataclasses import dataclass
 from time import perf_counter
 
 from .config import LiteStoreConfig
-from .errors import LiteStoreError, PersistenceError
+from .errors import LiteStoreError
 from .metrics import MetricsCollector
 from .persistence import AofPersistence
 from .protocol import parse_command, serialize_response
 from .router import DeterministicHashRouter
-from .types import CommandName, CommandRequest, CommandResponse, ErrorCode, ResponseKind
+from .types import CommandName, CommandRequest, CommandResponse, ErrorCode, FsyncPolicy, ResponseKind
 from .worker import StoreWorker
+from .worker_pool import WorkerPool
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,17 +49,32 @@ class LiteStoreRuntime:
 
 	def __init__(self, config: LiteStoreConfig) -> None:
 		self._config = config
+		self._use_multiprocessing = config.use_multiprocessing
 		worker_ids = [f"w{index}" for index in range(config.worker_count)]
 		self._router = DeterministicHashRouter(worker_ids)
-		self._workers = {
-			worker_id: StoreWorker(worker_id=worker_id, partition_id=index, threaded=True)
-			for index, worker_id in enumerate(worker_ids)
-		}
+
+		if self._use_multiprocessing:
+			self._worker_pool = WorkerPool(
+				worker_count=config.worker_count,
+				aof_base_path=config.aof_path,
+				fsync_policy=FsyncPolicy(getattr(config, "fsync_policy", FsyncPolicy.EVERY_N)),
+				fsync_every_n=getattr(config, "fsync_every_n_writes", 100),
+			)
+			self._workers: dict[str, StoreWorker] | None = None
+			self._persistence: AofPersistence | None = None
+		else:
+			self._worker_pool = None  # type: ignore[assignment]
+			self._workers = {
+				worker_id: StoreWorker(worker_id=worker_id, partition_id=index)
+				for index, worker_id in enumerate(worker_ids)
+			}
+			self._persistence = AofPersistence(config.aof_path)
+
 		self._metrics = MetricsCollector()
 		self._metrics_endpoint = MetricsHttpEndpoint(self._metrics)
-		self._persistence = AofPersistence(config.aof_path)
 		self._tcp_server: asyncio.AbstractServer | None = None
 		self._metrics_server: asyncio.AbstractServer | None = None
+		self._metrics_refresh_task: asyncio.Task[None] | None = None
 		self._connection_sequence = 0
 
 	@property
@@ -71,11 +87,14 @@ class LiteStoreRuntime:
 
 	async def start(self) -> None:
 		"""Start worker-owned runtime surfaces and replay persisted state."""
-		for worker in self._workers.values():
-			worker.start()
-
-		self._replay_persistence()
-		await self._refresh_metrics_snapshot()
+		if self._use_multiprocessing:
+			self._worker_pool.start_all()
+		else:
+			assert self._workers is not None
+			for worker in self._workers.values():
+				worker.start()
+			self._replay_persistence()
+			await self._refresh_metrics_snapshot()
 
 		self._tcp_server = await asyncio.start_server(
 			self._handle_client,
@@ -87,9 +106,18 @@ class LiteStoreRuntime:
 			host=self._config.metrics_host,
 			port=self._config.metrics_port,
 		)
+		self._metrics_refresh_task = asyncio.create_task(self._periodic_metrics_refresh())
 
 	async def close(self) -> None:
 		"""Gracefully shut down network listeners and owned resources."""
+		if self._metrics_refresh_task is not None:
+			self._metrics_refresh_task.cancel()
+			try:
+				await self._metrics_refresh_task
+			except asyncio.CancelledError:
+				pass
+			self._metrics_refresh_task = None
+
 		if self._tcp_server is not None:
 			self._tcp_server.close()
 			await self._tcp_server.wait_closed()
@@ -100,10 +128,14 @@ class LiteStoreRuntime:
 			await self._metrics_server.wait_closed()
 			self._metrics_server = None
 
-		for worker in self._workers.values():
-			worker.stop()
-
-		self._persistence.close()
+		if self._use_multiprocessing:
+			self._worker_pool.shutdown_all()
+		else:
+			assert self._workers is not None
+			for worker in self._workers.values():
+				worker.stop()
+			if self._persistence:
+				self._persistence.close()
 
 	async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
 		connection_id = self._next_connection_id(writer)
@@ -167,31 +199,42 @@ class LiteStoreRuntime:
 
 	async def _dispatch_request(self, request: CommandRequest) -> CommandResponse:
 		route = self._router.route_request(request)
+
+		if self._use_multiprocessing:
+			return await self._worker_pool.execute(route.worker_id, request)
+
+		assert self._workers is not None
 		worker = self._workers[route.worker_id]
 		response = await worker.execute_async(request)
 
-		if _is_persisted_write(request, response):
+		if self._persistence and _is_persisted_write(request, response):
 			try:
 				self._persistence.append_request(request)
 			except OSError as exc:
 				return _error_response(ErrorCode.PERSISTENCE_ERROR, f"Persistence append failed: {exc}", request.request_id)
-			await self._refresh_metrics_snapshot()
-		elif request.command in {CommandName.GET, CommandName.TTL}:
-			await self._refresh_metrics_snapshot()
 
 		return response
 
 	def _replay_persistence(self) -> None:
+		if not self._persistence or not self._workers:
+			return
 		for record in self._persistence.replay():
 			route = self._router.route_request(record.request)
 			worker = self._workers[route.worker_id]
 			worker.execute(record.request)
 
+	async def _periodic_metrics_refresh(self) -> None:
+		"""Background task that refreshes store metrics on a configurable interval."""
+		while True:
+			await asyncio.sleep(self._config.metrics_refresh_interval_seconds)
+			await self._refresh_metrics_snapshot()
+
 	async def _refresh_metrics_snapshot(self) -> None:
-		aggregated: dict[str, str] = {}
-		for worker in self._workers.values():
-			aggregated.update(await worker.snapshot_async())
-		self._metrics.observe_store_snapshot(aggregated)
+		if not self._use_multiprocessing and self._workers:
+			aggregated: dict[str, str] = {}
+			for worker in self._workers.values():
+				aggregated.update(await worker.snapshot_async())
+			self._metrics.observe_store_snapshot(aggregated)
 
 	def _next_connection_id(self, writer: asyncio.StreamWriter) -> str:
 		self._connection_sequence += 1

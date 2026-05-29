@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from threading import Lock
 from typing import Mapping, Sequence
 
+from .countmin import TopKTracker
 from .types import CommandRequest
 
 
@@ -30,7 +31,7 @@ class MetricsCollector:
 		self._latency_sum_by_command: Counter[str] = Counter()
 		self._latency_count_by_command: Counter[str] = Counter()
 		self._latency_bucket_counts: dict[str, Counter[float]] = {}
-		self._hot_keys: Counter[str] = Counter()
+		self._hot_key_tracker = TopKTracker(k=100, sketch_width=2048, sketch_depth=4)
 		self._memory_by_prefix_bytes: Counter[str] = Counter()
 
 	def observe_command(self, request: CommandRequest, duration_seconds: float) -> None:
@@ -45,7 +46,7 @@ class MetricsCollector:
 
 			if request.args:
 				key = request.args[0]
-				self._hot_keys[key] += 1
+				self._hot_key_tracker.record(key)
 
 	def observe_store_snapshot(self, data: Mapping[str, str]) -> None:
 		"""Recompute approximate memory usage grouped by key prefix."""
@@ -60,7 +61,8 @@ class MetricsCollector:
 	def hot_keys(self, limit: int = 10) -> list[HotKeyEntry]:
 		"""Return current hot keys in descending access order."""
 		with self._lock:
-			return [HotKeyEntry(key=key, count=count) for key, count in self._hot_keys.most_common(limit)]
+			top = self._hot_key_tracker.top_k()[:limit]
+			return [HotKeyEntry(key=key, count=count) for key, count in top]
 
 	def render_prometheus(self) -> str:
 		"""Render metrics in Prometheus exposition format."""
@@ -114,7 +116,7 @@ class MetricsCollector:
 					"# TYPE litestore_hot_key_access_total gauge",
 				]
 			)
-			for key, count in self._hot_keys.most_common():
+			for key, count in self._hot_key_tracker.top_k():
 				lines.append(f'litestore_hot_key_access_total{{key="{_escape_label_value(key)}"}} {count}')
 
 			lines.extend(

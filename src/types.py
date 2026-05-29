@@ -28,6 +28,14 @@ class ResponseKind(str, Enum):
     ERROR = "error"
 
 
+class FsyncPolicy(str, Enum):
+    """Persistence fsync strategy."""
+
+    NEVER = "never"
+    ALWAYS = "always"
+    EVERY_N = "every_n"
+
+
 class ErrorCode(str, Enum):
     """Stable error code namespace shared across modules."""
 
@@ -98,3 +106,33 @@ class ErrorDetails:
     code: ErrorCode
     message: str
     context: Mapping[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerRequest:
+    """Serializable request sent to worker process via queue."""
+
+    request_id: str
+    command: CommandName
+    args: tuple[str, ...]
+    client_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerResponse:
+    """Serializable response from worker process via queue."""
+
+    request_id: str
+    kind: ResponseKind
+    message: str | None = None
+    value: str | None = None
+    integer: int | None = None
+    error_code: ErrorCode | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerControl:
+    """Control messages for worker process lifecycle."""
+
+    action: str
+    request_id: str | None = None
