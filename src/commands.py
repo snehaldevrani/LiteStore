@@ -29,10 +29,10 @@ def execute_command(request: CommandRequest, store: StoreInterface) -> CommandRe
 		if not _has_arity(request, expected=1):
 			return _wrong_arity_response(request, expected=1)
 		(key,) = request.args
-		value = store.get(key)
-		if value is None:
+		result = store.get(key)
+		if result is None:
 			return CommandResponse(kind=ResponseKind.NULL, request_id=request.request_id)
-		return CommandResponse(kind=ResponseKind.BULK_STRING, value=value, request_id=request.request_id)
+		return CommandResponse(kind=ResponseKind.BULK_STRING, value=result, request_id=request.request_id)
 
 	if request.command == CommandName.DEL:
 		if not _has_arity(request, expected=1):

@@ -28,7 +28,7 @@ class MetricsCollector:
 		self._lock = Lock()
 		self._throughput_total = 0
 		self._throughput_by_command: Counter[str] = Counter()
-		self._latency_sum_by_command: Counter[str] = Counter()
+		self._latency_sum_by_command: dict[str, float] = {}
 		self._latency_count_by_command: Counter[str] = Counter()
 		self._latency_bucket_counts: dict[str, Counter[float]] = {}
 		self._hot_key_tracker = TopKTracker(k=100, sketch_width=2048, sketch_depth=4)
@@ -40,7 +40,7 @@ class MetricsCollector:
 		with self._lock:
 			self._throughput_total += 1
 			self._throughput_by_command[command_name] += 1
-			self._latency_sum_by_command[command_name] += duration_seconds
+			self._latency_sum_by_command[command_name] = self._latency_sum_by_command.get(command_name, 0.0) + duration_seconds
 			self._latency_count_by_command[command_name] += 1
 			self._observe_latency_bucket(command_name, duration_seconds)
 

@@ -72,8 +72,8 @@ class LiteStoreRuntime:
 
 		self._metrics = MetricsCollector()
 		self._metrics_endpoint = MetricsHttpEndpoint(self._metrics)
-		self._tcp_server: asyncio.AbstractServer | None = None
-		self._metrics_server: asyncio.AbstractServer | None = None
+		self._tcp_server: asyncio.Server | None = None
+		self._metrics_server: asyncio.Server | None = None
 		self._metrics_refresh_task: asyncio.Task[None] | None = None
 		self._connection_sequence = 0
 
@@ -265,7 +265,7 @@ def _error_response(code: ErrorCode, message: str, request_id: str | None) -> Co
 	)
 
 
-def _bound_port(server: asyncio.AbstractServer | None) -> int:
+def _bound_port(server: asyncio.Server | None) -> int:
 	if server is None or server.sockets is None or not server.sockets:
 		return 0
 	return int(server.sockets[0].getsockname()[1])
