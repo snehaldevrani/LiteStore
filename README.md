@@ -126,7 +126,7 @@ Three AOF durability modes:
 Each worker writes its own independent shard:
 
 - `w0` → `data/litestore-w0.aof`, `w1` → `data/litestore-w1.aof`, etc.
-- Recovery on startup replays each shard in parallel — one goroutine per partition
+- Recovery on startup replays each shard in parallel — one worker process per partition
 - Consistent by design: routing is deterministic, so the same key always lands on the same partition
 
 ## Persistence Format

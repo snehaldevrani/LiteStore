@@ -33,6 +33,10 @@ coverage.xml
 litestore.aof
 *.aof
 
+# Private local notes
+INTERVIEW_PREP.md
+redis.md
+
 # OS / editor
 .DS_Store
 Thumbs.db
