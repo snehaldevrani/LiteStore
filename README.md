@@ -1,57 +1,61 @@
 # LiteStore
 
-A Redis-inspired key-value server implementing shared-nothing multi-process execution, deterministic TTL expiration via timing wheels, bounded-memory hot-key detection via Count-Min Sketch, and configurable-fsync append-only persistence.
+A Redis-inspired key-value server built from scratch in Python. Implements three architectural improvements over Redis:
+
+1. **Shared-nothing multiprocessing** — one process per key partition, each with its own interpreter, bypassing CPython's GIL for true parallelism under concurrent TCP load
+2. **Timing wheel TTL eviction** — O(1) insertion and expiry discovery, replacing Redis's probabilistic expiry sampling
+3. **Bounded-memory hot-key detection** — Count-Min Sketch (32 KB fixed) + min-heap Top-K tracker, replacing Redis's unbounded key-space scan
+
+Benchmarked at **372,000 ops/sec** (single-store in-process) on EC2. Deployed with systemd.
+
+---
 
 ## Architecture
 
-LiteStore runs two listeners:
+LiteStore runs two listeners concurrently:
 
-- **TCP command listener** (default `:6379`) — accepts key-value commands
-- **HTTP metrics listener** (default `:9100`) — serves `/metrics` in Prometheus exposition format
+- **TCP server** (default `:6379`) — accepts commands from clients
+- **HTTP metrics server** (default `:9100`) — serves `GET /metrics` in Prometheus exposition format
 
-Each key maps deterministically to one worker **process** via SHA-256 hash routing. Each worker process owns its own MemoryStore, TimingWheel, and AOF shard — achieving parallel execution without shared mutable state.
+Every incoming key routes deterministically to a single worker **process** via SHA-256 modulo partition count. Each process owns its own `MemoryStore`, `TimingWheel`, and AOF shard — no shared state, no locks.
 
 ```text
                     +-----------------------------------+
-Client (TCP) -----> | Main Process (asyncio TCP server) |
+Client (TCP) -----> | Main Process (asyncio event loop) |
                     | parse -> route -> IPC dispatch    |
                     +----------------+------------------+
                                      |
-                                     v
-                       +-------------+--------------+
-                       | DeterministicHashRouter    |
-                       | (SHA-256 modulo partition) |
-                       +-------------+--------------+
+                             SHA-256 mod N
                                      |
          +---------------------------+---------------------------+
          |                           |                           |
          v (Queue)                   v (Queue)                   v (Queue)
 +----------------+            +----------------+          +----------------+
-| Process w0     |            | Process w1     |   ...    | Process wN     |
+| Worker w0      |            | Worker w1      |   ...    | Worker wN-1    |
 | MemoryStore    |            | MemoryStore    |          | MemoryStore    |
 | TimingWheel    |            | TimingWheel    |          | TimingWheel    |
-| AOF shard w0   |            | AOF shard w1   |          | AOF shard wN   |
+| AOF shard 0    |            | AOF shard 1    |          | AOF shard N-1  |
 +----------------+            +----------------+          +----------------+
 
-HTTP /metrics ---------> +---------------------------+
-                         | MetricsCollector          |
-                         | Count-Min Sketch hot keys |
-                         | Prometheus exposition     |
-                         +---------------------------+
+HTTP :9100 --------> +---------------------------+
+                     | MetricsCollector          |
+                     | Count-Min Sketch hot keys |
+                     | Prometheus text format    |
+                     +---------------------------+
 ```
 
 ## Request Lifecycle
 
 ```text
-1. Connection handler receives one command line over TCP
-2. protocol.parse_command -> CommandRequest
-3. router.route_request -> owning worker process (SHA-256 mod N)
-4. Main process sends WorkerRequest via multiprocessing.Queue
-5. Worker process executes command against its owned MemoryStore
-6. Worker appends to its per-partition AOF shard (with configurable fsync)
-7. Worker sends WorkerResponse back via response queue
-8. Main process records metrics (latency, throughput, hot-key via CMS)
-9. protocol.serialize_response -> returned to client over TCP
+1.  TCP handler reads one command line from client
+2.  protocol.parse_command()  → CommandRequest
+3.  router.route_request()    → partition ID via SHA-256 mod N
+4.  Main process enqueues WorkerRequest to selected process queue
+5.  Worker process executes command against its owned MemoryStore
+6.  Worker appends write to its per-partition AOF shard
+7.  Worker responds via response queue
+8.  Main process records latency + throughput + hot-key in MetricsCollector
+9.  protocol.serialize_response() → sent back to client over TCP
 ```
 
 ## Benchmark Results
@@ -80,52 +84,50 @@ At 10,000 keys (30,000 ops), concurrency 200:
 
 ## Design Decisions
 
-### Multiprocessing Over Threading
+### Multiprocessing over threading
 
-Python's GIL prevents threads from achieving CPU parallelism. LiteStore uses `multiprocessing` with one process per partition:
+Python's GIL prevents threads from achieving CPU parallelism on compute-bound work. LiteStore forks one process per partition:
 
-- Each process has its own Python interpreter — no GIL contention
-- IPC via `multiprocessing.Queue` pairs (request + response per worker)
-- Async bridge in main process via `run_in_executor` for non-blocking queue reads
+- Each process owns a separate Python interpreter — zero GIL contention
+- IPC via `multiprocessing.Queue` pairs (one request queue + one response queue per worker)
+- Async bridge in the main process via `run_in_executor` keeps the event loop non-blocking during queue reads
 - Shared-nothing: no locks, no mutexes, no shared memory between workers
 
-### Timing Wheel for TTL Expiration
+### Timing wheel for TTL expiration
 
-Each worker has a timing wheel for O(1) insertion and O(1) expiration discovery:
+O(1) insertion and O(1) expiry discovery per worker:
 
-- `EXPIRE key seconds` schedules deadline in wheel buckets
-- Worker expiration cycles proactively drain due entries
-- Expired keys are removed deterministically — they never linger waiting for client reads
-- Contrast with Redis's probabilistic approach: sample 20 random keys, delete expired, repeat if >25% hit
+- `EXPIRE key seconds` schedules a deadline entry in circular bucket slots
+- Each worker runs a background expiration cycle that drains all due entries since the last tick
+- Expired keys are removed proactively — they never linger until a client read
+- Redis uses probabilistic sampling (20 random keys, delete expired, repeat if > 25% hit rate) — this wheel guarantees expiration within one tick period
 
-### Count-Min Sketch for Hot-Key Detection
+### Count-Min Sketch for hot-key detection
 
-Fixed-memory probabilistic frequency estimation:
+Constant-memory frequency estimation regardless of key cardinality:
 
-- 4 hash functions x 2048 counters = ~32KB regardless of key cardinality
-- O(1) increment, O(1) frequency estimation
-- Top-K tracker using min-heap alongside the sketch
-- Never underestimates (can slightly overestimate due to hash collisions)
+- 4 hash rows × 2048 columns = ~32 KB fixed footprint
+- O(1) increment, O(1) minimum estimate (conservative — never underestimates)
+- Top-K tracker: min-heap evicts the lowest-frequency key when a new candidate exceeds it
+- **Lazy deletion in the heap** — stale heap entries are discarded on read rather than rebuilding the entire heap on every update (O(1) amortized vs. previous O(k) rebuild)
 
-### Configurable Fsync Policy
+### Configurable fsync policy
 
-Three durability modes for AOF persistence:
+Three AOF durability modes:
 
 | Policy | Behavior | Trade-off |
 |--------|----------|-----------|
-| `never` | OS-managed flush only | Fastest writes, risk of data loss on OS crash |
-| `always` | `fsync()` after every write | Safest, highest write latency |
-| `every_n` | `fsync()` every N writes (default: 100) | Balanced durability and throughput |
+| `never` | OS-managed flush only | Fastest writes; data loss possible on OS crash |
+| `always` | `os.fsync()` after every write | Maximum durability; highest write latency |
+| `every_n` | `fsync()` every N appends (default N=100) | Balanced throughput and durability |
 
-### Per-Partition AOF Sharding
+### Per-partition AOF sharding
 
-Each worker process writes its own AOF shard:
+Each worker writes its own independent shard:
 
-- Worker `w0` writes to `data/litestore-w0.aof`
-- Worker `w1` writes to `data/litestore-w1.aof`
-- Replay is per-partition on startup — each worker replays only its own shard
-- Enables parallel recovery across workers
-- Consistent because routing is deterministic (same key always maps to same partition)
+- `w0` → `data/litestore-w0.aof`, `w1` → `data/litestore-w1.aof`, etc.
+- Recovery on startup replays each shard in parallel — one goroutine per partition
+- Consistent by design: routing is deterministic, so the same key always lands on the same partition
 
 ## Persistence Format
 
@@ -153,13 +155,24 @@ Built-in metrics served at `GET /metrics` in Prometheus text exposition format:
 ## Commands
 
 ```text
-PING               -> +PONG
-SET key value      -> +OK
-GET key            -> $value (or $-1 if missing)
-DEL key            -> :1 (or :0 if missing)
-EXPIRE key secs    -> :1 (or :0 if key missing)
-TTL key            -> :seconds_remaining (or :-1 no expiry, :-2 missing)
+PING               → +PONG
+SET key value      → +OK
+GET key            → $value  (or $-1 if missing)
+DEL key            → :1      (or :0 if not found)
+EXPIRE key secs    → :1      (or :0 if key missing)
+TTL key            → :remaining_seconds  (:-1 no expiry, :-2 missing)
+MGET key [key …]   → *N array of $value / $-1 entries
+KEYS [pattern]     → *N array of matching key names  (* glob, default *)
+FLUSHALL           → :N  (number of keys removed)
 ```
+
+All responses use a simplified RESP-like text protocol:
+- `+` simple string
+- `$` bulk string
+- `:` integer
+- `$-1` null bulk string
+- `*N` array prefix followed by N bulk-string entries
+- `-ERR CODE message` error
 
 ## Configuration
 
@@ -205,18 +218,21 @@ python scripts/benchmark_compare.py --keys 5000 --workers 4 --concurrency 100
 
 ## Testing
 
-87 tests covering:
+87 tests across all components:
 
-- Command correctness (SET, GET, DEL, EXPIRE, TTL, PING)
-- Protocol parsing and serialization
-- Timing wheel expiration semantics
-- Count-Min Sketch accuracy bounds
-- Fsync policy behavior (mocked `os.fsync`)
-- AOF persistence and crash recovery
-- Worker process lifecycle and IPC
-- Worker pool concurrent dispatch
-- Sharding isolation and deterministic routing
-- End-to-end TCP integration (socket-level)
+| Area | Tests |
+|------|-------|
+| Commands (SET/GET/DEL/EXPIRE/TTL/MGET/KEYS/FLUSHALL) | `test_commands.py` |
+| Protocol parsing and serialization | `test_protocol.py` |
+| Timing wheel expiration semantics | `test_timing_wheel.py`, `test_ttl.py` |
+| Count-Min Sketch accuracy bounds | `test_countmin.py` |
+| Fsync policy behavior (mocked `os.fsync`) | `test_fsync_policy.py` |
+| AOF persistence and crash recovery | `test_persistence.py`, `test_recovery_integration.py` |
+| Worker process lifecycle and IPC | `test_process_worker.py`, `test_worker_thread_lifecycle.py` |
+| Worker pool concurrent dispatch | `test_worker_pool.py`, `test_worker_concurrency.py` |
+| Sharding isolation and deterministic routing | `test_sharding.py` |
+| End-to-end TCP integration (socket-level) | `test_integration_server.py` |
+| Throughput comparison across modes | `test_throughput_compare.py` |
 
 ## CI/CD
 

@@ -48,6 +48,20 @@ def parse_command(raw_command: str, *, request_id: str | None = None, client_id:
 		_ensure_arity(verb, args, expected=1)
 		return CommandRequest(command=CommandName.TTL, args=args, request_id=request_id, client_id=client_id)
 
+	if verb == CommandName.MGET.value:
+		if len(args) < 1:
+			raise WrongArityError(f"MGET requires at least 1 key", context={"command": verb})
+		return CommandRequest(command=CommandName.MGET, args=args, request_id=request_id, client_id=client_id)
+
+	if verb == CommandName.KEYS.value:
+		if len(args) > 1:
+			raise WrongArityError(f"KEYS accepts 0 or 1 arguments", context={"command": verb})
+		return CommandRequest(command=CommandName.KEYS, args=args, request_id=request_id, client_id=client_id)
+
+	if verb == CommandName.FLUSHALL.value:
+		_ensure_arity(verb, args, expected=0)
+		return CommandRequest(command=CommandName.FLUSHALL, args=(), request_id=request_id, client_id=client_id)
+
 	raise UnknownCommandError(f"Unsupported command: {verb}", context={"command": verb})
 
 
@@ -70,6 +84,12 @@ def serialize_response(response: CommandResponse) -> str:
 	if response.kind == ResponseKind.NULL:
 		return "$-1\r\n"
 
+	if response.kind == ResponseKind.ARRAY:
+		lines = [f"*{len(response.values)}\r\n"]
+		for item in response.values:
+			lines.append("$-1\r\n" if item is None else f"${item}\r\n")
+		return "".join(lines)
+
 	if response.kind == ResponseKind.ERROR:
 		code = response.error_code.value if response.error_code is not None else ErrorCode.INTERNAL_ERROR.value
 		message = response.message if response.message is not None else "Unknown error"
@@ -91,6 +111,10 @@ def _split_command(command_line: str) -> tuple[str, tuple[str, ...]]:
 		if len(set_parts) < 3:
 			return verb, tuple(set_parts[1:])
 		return verb, (set_parts[1], set_parts[2])
+
+	if verb == CommandName.MGET.value:
+		# All remaining tokens are keys
+		return verb, tuple(first_split[1].split())
 
 	return verb, tuple(first_split[1].split())
 

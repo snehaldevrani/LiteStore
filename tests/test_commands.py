@@ -116,7 +116,7 @@ def test_expire_with_non_integer_seconds_returns_error() -> None:
 
 def test_unknown_command_returns_error_response() -> None:
     store = MemoryStore()
-    request = replace(CommandRequest(command=CommandName.PING), command="MGET")
+    request = replace(CommandRequest(command=CommandName.PING), command="ZADD")
 
     response = execute_command(request, store)
 

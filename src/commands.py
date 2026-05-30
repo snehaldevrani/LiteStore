@@ -67,6 +67,35 @@ def execute_command(request: CommandRequest, store: StoreInterface) -> CommandRe
 		remaining = store.ttl(key)
 		return CommandResponse(kind=ResponseKind.INTEGER, integer=remaining, request_id=request.request_id)
 
+	if request.command == CommandName.MGET:
+		if len(request.args) < 1:
+			return CommandResponse(
+				kind=ResponseKind.ERROR,
+				error_code=ErrorCode.WRONG_ARITY,
+				message="MGET requires at least 1 key",
+				request_id=request.request_id,
+			)
+		values = tuple(store.get(k) for k in request.args)
+		return CommandResponse(kind=ResponseKind.ARRAY, values=values, request_id=request.request_id)
+
+	if request.command == CommandName.KEYS:
+		if len(request.args) > 1:
+			return CommandResponse(
+				kind=ResponseKind.ERROR,
+				error_code=ErrorCode.WRONG_ARITY,
+				message="KEYS accepts 0 or 1 arguments",
+				request_id=request.request_id,
+			)
+		pattern = request.args[0] if request.args else "*"
+		matched = store.keys(pattern)
+		return CommandResponse(kind=ResponseKind.ARRAY, values=tuple(matched), request_id=request.request_id)
+
+	if request.command == CommandName.FLUSHALL:
+		if not _has_arity(request, expected=0):
+			return _wrong_arity_response(request, expected=0)
+		count = store.flush()
+		return CommandResponse(kind=ResponseKind.INTEGER, integer=count, request_id=request.request_id)
+
 	return CommandResponse(
 		kind=ResponseKind.ERROR,
 		error_code=ErrorCode.UNKNOWN_COMMAND,

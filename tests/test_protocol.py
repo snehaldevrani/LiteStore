@@ -57,7 +57,7 @@ def test_parse_rejects_empty_input() -> None:
 
 def test_parse_rejects_unknown_command() -> None:
     try:
-        parse_command("MGET user:1")
+        parse_command("ZADD myset 1 member")
         assert False, "Expected UnknownCommandError"
     except UnknownCommandError as exc:
         assert exc.code == ErrorCode.UNKNOWN_COMMAND

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import time
 from typing import Callable, Dict
 
@@ -109,6 +110,9 @@ class MemoryStore:
 				return
 			self.expire(key, seconds)
 
+		if request.command == CommandName.FLUSHALL and len(request.args) == 0:
+			self.flush()
+
 	def process_expirations(self, now: float | None = None) -> int:
 		"""Drain due expirations from the timing wheel and remove expired keys."""
 		current_time = self._time_source() if now is None else now
@@ -128,3 +132,17 @@ class MemoryStore:
 	def _clear_expiry(self, key: str) -> None:
 		self._expires_at.pop(key, None)
 		self._timing_wheel.cancel(key)
+
+	def keys(self, pattern: str) -> list[str]:
+		"""Return all live key names matching a glob pattern ('*' matches all)."""
+		self.process_expirations()
+		return [k for k in self._data if fnmatch.fnmatch(k, pattern)]
+
+	def flush(self) -> int:
+		"""Delete all keys and return the count removed."""
+		self.process_expirations()
+		count = len(self._data)
+		self._data.clear()
+		self._expires_at.clear()
+		self._timing_wheel = TimingWheel()
+		return count

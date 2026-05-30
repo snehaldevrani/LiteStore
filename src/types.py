@@ -16,6 +16,9 @@ class CommandName(str, Enum):
     DEL = "DEL"
     EXPIRE = "EXPIRE"
     TTL = "TTL"
+    MGET = "MGET"
+    KEYS = "KEYS"
+    FLUSHALL = "FLUSHALL"
 
 
 class ResponseKind(str, Enum):
@@ -26,6 +29,7 @@ class ResponseKind(str, Enum):
     INTEGER = "integer"
     NULL = "null"
     ERROR = "error"
+    ARRAY = "array"
 
 
 class FsyncPolicy(str, Enum):
@@ -71,6 +75,7 @@ class CommandResponse:
     integer: int | None = None
     error_code: ErrorCode | None = None
     request_id: str | None = None
+    values: tuple[str | None, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True, slots=True)

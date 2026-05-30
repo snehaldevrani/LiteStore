@@ -28,6 +28,12 @@ class StoreInterface(Protocol):
     def process_expirations(self, now: float | None = None) -> int:
         """Remove keys whose TTL deadline has passed and return count removed."""
 
+    def keys(self, pattern: str) -> list[str]:
+        """Return all live key names matching a glob pattern ('*' matches all)."""
+
+    def flush(self) -> int:
+        """Delete all keys and return the count of keys removed."""
+
     def snapshot(self) -> dict[str, str]:
         """Return a copy of the current key-value state for aggregation or metrics."""
 

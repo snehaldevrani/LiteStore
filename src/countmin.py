@@ -35,8 +35,17 @@ class CountMinSketch:
         return value % self._width
 
 
+_HEAP_CLEANUP_RATIO = 3  # compact heap when stale entries exceed k * this factor
+
+
 class TopKTracker:
-    """Track top-K frequent keys using Count-Min Sketch + min-heap."""
+    """Track top-K frequent keys using Count-Min Sketch + min-heap.
+
+    Uses lazy deletion to avoid O(k) heap rebuilds on every update to a tracked
+    key.  Stale entries (where the stored count no longer matches _tracked) are
+    skipped when inspecting the minimum.  A periodic compact is triggered when
+    the heap grows beyond k * _HEAP_CLEANUP_RATIO to bound memory overhead.
+    """
 
     def __init__(self, k: int = 100, sketch_width: int = 2048, sketch_depth: int = 4) -> None:
         self._k = k
@@ -50,17 +59,26 @@ class TopKTracker:
         estimated = self._sketch.estimate(key)
 
         if key in self._tracked:
-            self._tracked[key] = estimated
-            self._rebuild_heap()
-        elif len(self._heap) < self._k:
+            # Lazy update: push a fresh entry; the old (stale) entry remains in
+            # the heap but will be skipped by _peek_min / _compact_heap.
             self._tracked[key] = estimated
             heapq.heappush(self._heap, (estimated, key))
-        else:
-            min_count, min_key = self._heap[0]
-            if estimated > min_count:
-                heapq.heapreplace(self._heap, (estimated, key))
-                del self._tracked[min_key]
-                self._tracked[key] = estimated
+            if len(self._heap) > self._k * _HEAP_CLEANUP_RATIO:
+                self._compact_heap()
+            return
+
+        if len(self._tracked) < self._k:
+            self._tracked[key] = estimated
+            heapq.heappush(self._heap, (estimated, key))
+            return
+
+        # Heap is at capacity — compare against the current (non-stale) minimum.
+        min_entry = self._peek_min()
+        if min_entry is not None and estimated > min_entry[0]:
+            _, evicted = heapq.heappop(self._heap)  # _peek_min guarantees current
+            del self._tracked[evicted]
+            self._tracked[key] = estimated
+            heapq.heappush(self._heap, (estimated, key))
 
     def top_k(self) -> list[tuple[str, int]]:
         """Return top K keys with approximate counts, descending by count."""
@@ -70,6 +88,16 @@ class TopKTracker:
             reverse=True,
         )
 
-    def _rebuild_heap(self) -> None:
+    def _peek_min(self) -> tuple[int, str] | None:
+        """Return the current minimum heap entry, discarding stale entries."""
+        while self._heap:
+            count, key = self._heap[0]
+            if self._tracked.get(key) == count:
+                return count, key
+            heapq.heappop(self._heap)  # stale — discard
+        return None
+
+    def _compact_heap(self) -> None:
+        """Rebuild heap from _tracked to remove accumulated stale entries."""
         self._heap = [(count, key) for key, count in self._tracked.items()]
         heapq.heapify(self._heap)
