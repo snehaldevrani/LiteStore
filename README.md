@@ -6,7 +6,7 @@ A Redis-inspired key-value server built from scratch in Python. Implements three
 2. **Timing wheel TTL eviction** — O(1) insertion and expiry discovery, replacing Redis's probabilistic expiry sampling
 3. **Bounded-memory hot-key detection** — Count-Min Sketch (32 KB fixed) + min-heap Top-K tracker, replacing Redis's unbounded key-space scan
 
-Benchmarked at **372,000 ops/sec** (single-store in-process) on EC2. Deployed with systemd.
+Benchmarked at **372,000 ops/sec** single-process baseline (Windows 11, Python 3.14 — see [Benchmark Results](#benchmark-results) for full breakdown including multiprocess mode). Deployed with systemd on EC2.
 
 ---
 
@@ -60,7 +60,9 @@ HTTP :9100 --------> +---------------------------+
 
 ## Benchmark Results
 
-Measured on Windows 11, Python 3.14, 14-thread CPU. Workload: 5000 keys x 3 operations (SET + GET + DEL) = 15,000 ops per run.
+Measured on **Windows 11, Python 3.14**, 14-thread CPU. Workload: 5000 keys × 3 operations (SET + GET + DEL) = 15,000 ops per run.
+
+> **Note:** `single-store` and `sharded` modes execute entirely in-process with no IPC overhead — they represent raw command execution speed and serve as a throughput ceiling. The `multiprocess` mode pays pickle serialization cost over `multiprocessing.Queue` per request, which dominates for trivially small in-memory operations. The multiprocess architecture's advantage is correctness under concurrent TCP load where Python's GIL would otherwise serialize all thread execution — not raw throughput in a single-client micro-benchmark.
 
 ```
 $ python scripts/benchmark_compare.py --keys 5000 --workers 4 --concurrency 100
