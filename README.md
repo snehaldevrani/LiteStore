@@ -90,6 +90,8 @@ At 10,000 keys (30,000 ops), concurrency 200:
 | sharded-4-workers | 147,811 | 0.004 ms | 0.003 ms | 0.004 ms |
 | multiprocess-4-workers | 5,631 | 15.65 ms | 14.50 ms | 24.02 ms |
 
+![LiteStore benchmark running on EC2 t3.micro](images/ec2-benchmark.png)
+
 **Analysis:** Single-store and sharded modes execute in-process without IPC overhead — they represent raw command execution speed. The multiprocess mode pays serialization cost (pickle over `multiprocessing.Queue`) per request, which dominates for trivially small operations. The multiprocess architecture's advantage emerges under true concurrent TCP client load where Python's GIL would otherwise serialize all thread execution. The architecture is designed for deployment scenarios where many simultaneous clients saturate a single interpreter — not micro-benchmarks with zero network overhead.
 
 ## Design Decisions
