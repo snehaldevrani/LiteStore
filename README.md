@@ -82,6 +82,14 @@ At 10,000 keys (30,000 ops), concurrency 200:
 | sharded-4-workers | 152,643 | 0.003 ms | 0.003 ms | 0.004 ms |
 | multiprocess-4-workers | 4,221 | 45.01 ms | 45.68 ms | 61.82 ms |
 
+**EC2 t3.micro (Ubuntu 26.04, deployed via systemd):**
+
+| mode | ops/sec | avg ms | p50 ms | p95 ms |
+|------|--------:|-------:|-------:|-------:|
+| single-store | 325,932 | 0.003 ms | 0.003 ms | 0.003 ms |
+| sharded-4-workers | 147,811 | 0.004 ms | 0.003 ms | 0.004 ms |
+| multiprocess-4-workers | 5,631 | 15.65 ms | 14.50 ms | 24.02 ms |
+
 **Analysis:** Single-store and sharded modes execute in-process without IPC overhead — they represent raw command execution speed. The multiprocess mode pays serialization cost (pickle over `multiprocessing.Queue`) per request, which dominates for trivially small operations. The multiprocess architecture's advantage emerges under true concurrent TCP client load where Python's GIL would otherwise serialize all thread execution. The architecture is designed for deployment scenarios where many simultaneous clients saturate a single interpreter — not micro-benchmarks with zero network overhead.
 
 ## Design Decisions
@@ -246,13 +254,74 @@ GitHub Actions runs on every push and PR:
 
 ## Deployment
 
-See `docs/deployment.md` for full EC2 + systemd instructions.
+LiteStore runs as a systemd service on EC2 (Ubuntu, t3.micro). All deployment artifacts are in `deploy/` and `scripts/`.
+
+### EC2 Setup
+
+1. Launch **Ubuntu 22.04+ LTS, t3.micro** (free tier eligible)
+2. Security group — restrict to your IP only (not 0.0.0.0/0):
+   - Port 22 (SSH)
+   - Port 6379 (LiteStore TCP server)
+   - Port 9100 (Prometheus metrics)
+
+> **Why not open to 0.0.0.0/0?** LiteStore has no password auth. Exposing port 6379 publicly lets anyone run `FLUSHALL` or read all your data. This is a known attack vector for misconfigured Redis instances.
+
+### Deploy via Bootstrap Script
 
 ```bash
-git clone <repo-url> litestore && cd litestore
-python3 -m venv .venv && . .venv/bin/activate
-pip install -r requirements.txt
-python -m src.main --host 0.0.0.0 --port 6379 --workers 4
+# On the EC2 instance
+export REPO_URL=https://github.com/snehaldevrani/LiteStore.git
+curl -fsSL https://raw.githubusercontent.com/snehaldevrani/LiteStore/main/scripts/deploy_ec2.sh -o deploy_ec2.sh
+bash deploy_ec2.sh
+```
+
+This script: installs git + python3, clones the repo to `/opt/litestore`, creates a venv, installs dependencies, creates a `litestore` system user, copies the service file, and starts the systemd service.
+
+### Verify Deployment
+
+```bash
+# Check service status
+sudo systemctl status litestore
+
+# Smoke test PING
+python3 -c "
+import socket
+s = socket.create_connection(('localhost', 6379))
+s.sendall(b'*1\r\n\$4\r\nPING\r\n')
+print(s.recv(100))
+s.close()
+"
+
+# Verify Prometheus metrics
+curl http://localhost:9100/metrics | head -20
+```
+
+### Run Benchmark on EC2
+
+```bash
+cd /opt/litestore
+sudo -u litestore .venv/bin/python scripts/benchmark_compare.py
+```
+
+### Why systemd (not screen/tmux)
+
+- `Restart=always` — auto-restarts on crash, no manual intervention
+- `systemctl enable` — survives instance reboots
+- `User=litestore` — dedicated system user, principle of least privilege
+- `NoNewPrivileges=true` + `PrivateTmp=true` — defense-in-depth hardening
+- `journald` integration — logs queryable with `journalctl -u litestore -f`
+
+### Configuration
+
+Runtime config lives at `/etc/litestore/litestore.env` (see `deploy/litestore.env.example`):
+
+```env
+LITESTORE_HOST=0.0.0.0
+LITESTORE_PORT=6379
+LITESTORE_METRICS_HOST=0.0.0.0
+LITESTORE_METRICS_PORT=9100
+LITESTORE_WORKERS=4
+LITESTORE_AOF_PATH=/var/lib/litestore/litestore.aof
 ```
 
 Deployment artifacts: `deploy/litestore.service`, `deploy/litestore.env.example`, `deploy/litestore.logrotate`
