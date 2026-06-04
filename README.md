@@ -6,7 +6,7 @@ A Redis-inspired key-value server built from scratch in Python. Implements three
 2. **Timing wheel TTL eviction** — O(1) insertion and expiry discovery, replacing Redis's probabilistic expiry sampling
 3. **Bounded-memory hot-key detection** — Count-Min Sketch (32 KB fixed) + min-heap Top-K tracker, replacing Redis's unbounded key-space scan
 
-Benchmarked at **372,000 ops/sec** single-process baseline (Windows 11, Python 3.14 — see [Benchmark Results](#benchmark-results) for full breakdown including multiprocess mode). Deployed with systemd on EC2.
+Benchmarked at **357,000 ops/sec** single-process baseline on **EC2 t3.micro** (Ubuntu 26.04, Python 3.14 — see [Benchmark Results](#benchmark-results) for full breakdown including multiprocess mode). Deployed with systemd on EC2.
 
 ---
 
@@ -82,13 +82,13 @@ At 10,000 keys (30,000 ops), concurrency 200:
 | sharded-4-workers | 152,643 | 0.003 ms | 0.003 ms | 0.004 ms |
 | multiprocess-4-workers | 4,221 | 45.01 ms | 45.68 ms | 61.82 ms |
 
-**EC2 t3.micro (Ubuntu 26.04, deployed via systemd):**
+**EC2 t3.micro (Ubuntu 26.04, Python 3.14, deployed via systemd — [screenshot](images/ec2-benchmark.png)):**
 
 | mode | ops/sec | avg ms | p50 ms | p95 ms |
 |------|--------:|-------:|-------:|-------:|
-| single-store | 325,932 | 0.003 ms | 0.003 ms | 0.003 ms |
-| sharded-4-workers | 147,811 | 0.004 ms | 0.003 ms | 0.004 ms |
-| multiprocess-4-workers | 5,631 | 15.65 ms | 14.50 ms | 24.02 ms |
+| single-store | 357,006 | 0.003 ms | 0.002 ms | 0.003 ms |
+| sharded-4-workers | 157,949 | 0.003 ms | 0.003 ms | 0.003 ms |
+| multiprocess-4-workers | 4,664 | 19.01 ms | 17.12 ms | 33.07 ms |
 
 ![LiteStore benchmark running on EC2 t3.micro](images/ec2-benchmark.png)
 
